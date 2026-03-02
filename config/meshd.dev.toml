@@ -1,0 +1,17 @@
+# Dev config for cachyos — run without root
+# Usage: cargo run -- --config config/meshd.dev.toml
+
+[node]
+name = "cachyos"
+wg_ip = "172.16.2.5"
+listen = "127.0.0.1:9800"
+
+[bridge]
+socket = "/tmp/meshd.sock"
+callback_url = "http://127.0.0.1:8000/api/mesh/inbound"
+
+# No peers for local testing — connect websocat manually
+[peers]
+
+[log]
+level = "debug"
