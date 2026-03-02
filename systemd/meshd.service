@@ -1,0 +1,25 @@
+[Unit]
+Description=NodeMesh Daemon
+After=network.target wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/meshd --config /etc/meshd/meshd.toml
+Restart=always
+RestartSec=5
+RuntimeDirectory=meshd
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meshd
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

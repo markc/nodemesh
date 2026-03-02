@@ -1,0 +1,23 @@
+# NodeMesh Daemon Configuration
+# Copy to /etc/meshd/meshd.toml (production) or ~/.config/meshd/meshd.toml (dev)
+
+[node]
+name = "cachyos"
+wg_ip = "172.16.2.5"
+listen = "0.0.0.0:9800"           # WebSocket server for inbound peers
+
+[bridge]
+socket = "/run/meshd/meshd.sock"   # Unix socket for Laravel ↔ meshd
+callback_url = "http://127.0.0.1:8000/api/mesh/inbound"
+
+# Static peer list — DNS SRV discovery replaces this in Phase 4
+[peers.mko]
+wg_ip = "172.16.2.210"
+port = 9800
+
+[peers.mmc]
+wg_ip = "172.16.2.9"
+port = 9800
+
+[log]
+level = "info"                     # Override: RUST_LOG=meshd=debug
