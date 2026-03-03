@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 
 use crate::config::PeerConfig;
 use crate::peer::connection;
+use crate::peer::connection::{KEEPALIVE_INTERVAL, READ_TIMEOUT};
 
 /// Reconnection backoff: 1s, 2s, 4s, 8s, 16s, 30s max.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -133,59 +134,70 @@ impl PeerManager {
     }
 
     /// Handle an inbound WebSocket connection from a peer (accepted by the server).
+    ///
+    /// If an outbound connection already owns the send channel for this peer,
+    /// the inbound runs read-only. Otherwise it becomes fully bidirectional.
     pub async fn handle_inbound(
         &self,
         peer_ip: IpAddr,
         ws_stream: axum::extract::ws::WebSocket,
     ) {
-        // We'll learn the peer name from their hello message.
-        // For now, use IP as temporary name.
         let temp_name = peer_ip.to_string();
         info!(from = %temp_name, "inbound peer connection");
 
-        let (outbound_tx, _outbound_rx) = mpsc::channel(256);
-
-        // For inbound connections, we use axum's WebSocket directly.
-        // Outbound writes will be added when we implement bidirectional inbound.
         let inbound_tx = self.inbound_tx.clone();
         let peers = self.peers.clone();
 
         tokio::spawn(async move {
             use axum::extract::ws::Message;
-            use futures_util::StreamExt;
+            use futures_util::{SinkExt, StreamExt};
 
-            let (_ws_write, mut ws_read) = ws_stream.split();
-            let mut peer_name = temp_name.clone();
-
-            // Read loop
-            while let Some(Ok(msg)) = ws_read.next().await {
-                match msg {
-                    Message::Text(text) => {
+            let (mut ws_write, mut ws_read) = ws_stream.split();
+            // Phase 1: Read hello to learn peer identity.
+            let peer_name = loop {
+                match ws_read.next().await {
+                    Some(Ok(Message::Text(text))) => {
                         if let Some(amp_msg) = AmpMessage::parse(&text) {
-                            // Learn peer name from hello
                             if amp_msg.command_name() == Some("hello") {
                                 if let Some(from) = amp_msg.from_addr() {
                                     if let Some(name) = from.strip_suffix(".amp") {
-                                        peer_name = name.to_string();
-                                        info!(peer = %peer_name, "identified inbound peer");
-
-                                        let mut peers = peers.write().await;
-                                        peers.insert(
-                                            peer_name.clone(),
-                                            PeerState {
-                                                name: peer_name.clone(),
-                                                wg_ip: temp_name.clone(),
-                                                connected: true,
-                                                last_seen: Some(Instant::now()),
-                                                outbound_tx: Some(outbound_tx.clone()),
-                                            },
-                                        );
+                                        info!(peer = %name, "identified inbound peer");
+                                        break name.to_string();
                                     }
                                 }
-                                continue;
                             }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return,
+                    _ => continue,
+                }
+            };
 
-                            if !amp_msg.is_empty_message() {
+            // Phase 2: Check if an outbound connection already owns the send channel.
+            let has_outbound = {
+                let peers_read = peers.read().await;
+                peers_read
+                    .get(&peer_name)
+                    .map_or(false, |s| s.connected && s.outbound_tx.is_some())
+            };
+
+            if has_outbound {
+                // Outbound connection handles sends — this inbound is read-only.
+                info!(peer = %peer_name, "outbound exists, inbound read-only");
+                {
+                    let mut peers_write = peers.write().await;
+                    if let Some(state) = peers_write.get_mut(&peer_name) {
+                        state.last_seen = Some(Instant::now());
+                    }
+                }
+
+                loop {
+                    match tokio::time::timeout(READ_TIMEOUT, ws_read.next()).await {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            if let Some(amp_msg) = AmpMessage::parse(&text) {
+                                if amp_msg.is_empty_message() {
+                                    continue;
+                                }
                                 if inbound_tx
                                     .send((peer_name.clone(), amp_msg))
                                     .await
@@ -195,18 +207,93 @@ impl PeerManager {
                                 }
                             }
                         }
+                        Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                        Ok(Some(Ok(_))) => continue,
+                        Ok(Some(Err(e))) => {
+                            warn!(peer = %peer_name, error = %e, "inbound read-only: read error");
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(peer = %peer_name, "inbound read-only: read timeout");
+                            break;
+                        }
                     }
-                    Message::Close(_) => break,
-                    _ => continue,
+                }
+            } else {
+                // No outbound connection — this inbound handles both read and write.
+                let (outbound_tx, mut outbound_rx) = mpsc::channel::<AmpMessage>(256);
+
+                {
+                    let mut peers_write = peers.write().await;
+                    peers_write.insert(
+                        peer_name.clone(),
+                        PeerState {
+                            name: peer_name.clone(),
+                            wg_ip: temp_name.clone(),
+                            connected: true,
+                            last_seen: Some(Instant::now()),
+                            outbound_tx: Some(outbound_tx),
+                        },
+                    );
+                }
+
+                // Bidirectional loop with keepalive.
+                let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+                keepalive.tick().await; // first tick is immediate
+
+                loop {
+                    tokio::select! {
+                        Some(msg) = outbound_rx.recv() => {
+                            let wire = msg.to_wire();
+                            if ws_write.send(Message::Text(wire.into())).await.is_err() {
+                                warn!(peer = %peer_name, "inbound: write failed");
+                                break;
+                            }
+                        }
+                        _ = keepalive.tick() => {
+                            let empty = AmpMessage::empty().to_wire();
+                            if ws_write.send(Message::Text(empty.into())).await.is_err() {
+                                warn!(peer = %peer_name, "inbound: keepalive failed");
+                                break;
+                            }
+                        }
+                        result = tokio::time::timeout(READ_TIMEOUT, ws_read.next()) => {
+                            match result {
+                                Ok(Some(Ok(Message::Text(text)))) => {
+                                    if let Some(amp_msg) = AmpMessage::parse(&text) {
+                                        if amp_msg.is_empty_message() { continue; }
+                                        if inbound_tx
+                                            .send((peer_name.clone(), amp_msg))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                                Ok(Some(Ok(_))) => continue,
+                                Ok(Some(Err(e))) => {
+                                    warn!(peer = %peer_name, error = %e, "inbound: read error");
+                                    break;
+                                }
+                                Err(_) => {
+                                    warn!(peer = %peer_name, "inbound: read timeout ({}s)", READ_TIMEOUT.as_secs());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Only clear outbound_tx if we still own it (outbound may have taken over).
+                let mut peers_write = peers.write().await;
+                if let Some(state) = peers_write.get_mut(&peer_name) {
+                    state.connected = false;
+                    state.outbound_tx = None;
                 }
             }
 
-            // Mark disconnected
-            let mut peers = peers.write().await;
-            if let Some(state) = peers.get_mut(&peer_name) {
-                state.connected = false;
-                state.outbound_tx = None;
-            }
             info!(peer = %peer_name, "inbound connection ended");
         });
     }

@@ -9,10 +9,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
 /// Keepalive interval — send empty AMP every 15 seconds.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Read timeout — if no message received in 45s (3x keepalive), consider dead.
-const READ_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Handle a live outbound WebSocket connection to a peer.
 ///
