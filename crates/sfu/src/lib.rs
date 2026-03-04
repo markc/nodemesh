@@ -57,12 +57,23 @@ impl SfuHandle {
         let socket = UdpSocket::bind(config.udp_bind).await?;
         let local_addr = socket.local_addr()?;
 
-        info!(bind = %local_addr, "SFU started");
+        // Resolve 0.0.0.0 to the actual IP — must match the ICE candidate
+        // address used in Session::handle_sdp_offer()
+        let candidate_addr = if local_addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(
+                session::detect_local_ip(),
+                local_addr.port(),
+            )
+        } else {
+            local_addr
+        };
+
+        info!(bind = %local_addr, candidate = %candidate_addr, "SFU started");
 
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (evt_tx, evt_rx) = mpsc::channel(256);
 
-        tokio::spawn(sfu_loop(socket, local_addr, cmd_rx, evt_tx));
+        tokio::spawn(sfu_loop(socket, candidate_addr, cmd_rx, evt_tx));
 
         Ok((Self { cmd_tx }, evt_rx))
     }

@@ -1,10 +1,18 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use amp::AmpMessage;
 use str0m::change::SdpOffer;
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 use tracing::{debug, info, warn};
+
+/// Detect the machine's default local IP by UDP-connecting to a public address.
+/// This doesn't send any packets — it just lets the OS pick the outgoing interface.
+pub fn detect_local_ip() -> IpAddr {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind ephemeral");
+    socket.connect("8.8.8.8:80").expect("connect probe");
+    socket.local_addr().expect("local_addr").ip()
+}
 
 /// A WebRTC session wrapping a str0m Rtc instance.
 ///
@@ -46,8 +54,13 @@ impl Session {
         let now = Instant::now();
         let mut rtc = Rtc::new(now);
 
-        // Add local ICE candidate (the UDP address we're listening on)
-        let candidate = Candidate::host(local_addr, "udp")
+        // Add local ICE candidate — if bound to 0.0.0.0, detect the real IP
+        let candidate_addr = if local_addr.ip().is_unspecified() {
+            SocketAddr::new(detect_local_ip(), local_addr.port())
+        } else {
+            local_addr
+        };
+        let candidate = Candidate::host(candidate_addr, "udp")
             .map_err(|e| format!("invalid candidate: {e}"))?;
         rtc.add_local_candidate(candidate);
 

@@ -1,0 +1,21 @@
+[package]
+name = "sfu-test"
+version = "0.1.0"
+edition = "2021"
+description = "Browser test harness for WebRTC SFU loopback"
+
+[[bin]]
+name = "sfu-test"
+path = "src/main.rs"
+
+[dependencies]
+amp = { path = "../../crates/amp" }
+tokio = { workspace = true }
+axum = "0.8"
+hyper = { version = "1", features = ["client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

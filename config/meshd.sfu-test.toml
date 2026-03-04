@@ -1,0 +1,23 @@
+# SFU browser test config — callback points to sfu-test harness on :3000
+# Usage:
+#   Terminal 1: cargo run -p meshd -- --config config/meshd.sfu-test.toml
+#   Terminal 2: cargo run -p sfu-test
+#   Browser:    http://localhost:3000
+
+[node]
+name = "cachyos"
+wg_ip = "172.16.2.5"
+listen = "127.0.0.1:9800"
+
+[bridge]
+socket = "/tmp/meshd.sock"
+callback_url = "http://127.0.0.1:3000/api/mesh/inbound"
+
+[peers]
+
+[log]
+level = "debug"
+
+[sfu]
+enabled = true
+udp_bind = "0.0.0.0:9801"
