@@ -26,13 +26,15 @@
 <h1>WebRTC SFU Loopback Test</h1>
 
 <div class="controls">
-  <button id="startBtn" onclick="startLoopback()">Start Loopback</button>
+  <button id="micBtn" onclick="startLoopback('mic')">Mic Only</button>
+  <button id="camBtn" onclick="startLoopback('camera')">Camera + Mic</button>
+  <button id="screenBtn" onclick="startLoopback('screen')">Share Screen</button>
   <button id="stopBtn" onclick="stopLoopback()" disabled>Stop</button>
 </div>
 
 <div class="videos">
   <div class="video-box">
-    <h3>Local (camera/mic)</h3>
+    <h3 id="localLabel">Local</h3>
     <video id="localVideo" autoplay muted playsinline></video>
   </div>
   <div class="video-box">
@@ -54,20 +56,34 @@ function log(msg) {
   el.scrollTop = el.scrollHeight;
 }
 
-async function startLoopback() {
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn = document.getElementById('stopBtn');
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
+async function startLoopback(mode) {
+  document.getElementById('micBtn').disabled = true;
+  document.getElementById('camBtn').disabled = true;
+  document.getElementById('screenBtn').disabled = true;
+  document.getElementById('stopBtn').disabled = false;
 
   try {
-    // Get camera + mic
-    log('Requesting camera and microphone...');
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    } catch (e) {
-      log('No camera, trying audio-only: ' + e.message);
+    // Get media based on mode
+    if (mode === 'screen') {
+      log('Requesting screen share...');
+      localStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,  // system audio (browser will ask)
+      });
+      document.getElementById('localLabel').textContent = 'Local (screen)';
+    } else if (mode === 'camera') {
+      log('Requesting camera and microphone...');
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      } catch (e) {
+        log('No camera, trying audio-only: ' + e.message);
+        localStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+      }
+      document.getElementById('localLabel').textContent = 'Local (camera)';
+    } else {
+      log('Requesting microphone...');
       localStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+      document.getElementById('localLabel').textContent = 'Local (mic)';
     }
     document.getElementById('localVideo').srcObject = localStream;
     log('Got local media: ' + localStream.getTracks().map(t => t.kind).join(', '));
@@ -169,7 +185,10 @@ function stopLoopback() {
   }
   document.getElementById('localVideo').srcObject = null;
   document.getElementById('remoteVideo').srcObject = null;
-  document.getElementById('startBtn').disabled = false;
+  document.getElementById('micBtn').disabled = false;
+  document.getElementById('camBtn').disabled = false;
+  document.getElementById('screenBtn').disabled = false;
+  document.getElementById('localLabel').textContent = 'Local';
   document.getElementById('stopBtn').disabled = true;
   log('Stopped.');
 }
