@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 amp = { path = "../amp" }
+sfu = { path = "../sfu" }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
@@ -29,3 +30,4 @@ anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3"
+str0m = { workspace = true }

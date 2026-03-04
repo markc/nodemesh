@@ -15,3 +15,7 @@ callback_url = "http://127.0.0.1:8000/api/mesh/inbound"
 
 [log]
 level = "debug"
+
+[sfu]
+enabled = true
+udp_bind = "127.0.0.1:9801"

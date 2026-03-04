@@ -6,10 +6,11 @@ mod server;
 
 use config::Config;
 use peer::manager::PeerManager;
+use sfu::{SfuConfig, SfuEvent, SfuHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -51,9 +52,41 @@ async fn main() {
     let resolved = peer::resolver::resolve_peers(&config.peers);
     peer_manager.connect_to_peers(&resolved).await;
 
+    // Optional SFU startup
+    let sfu_handle = if let Some(ref sfu_cfg) = config.sfu {
+        if sfu_cfg.enabled {
+            let udp_bind = sfu_cfg
+                .udp_bind
+                .parse()
+                .expect("invalid sfu.udp_bind address");
+            let sfu_config = SfuConfig { udp_bind };
+
+            match SfuHandle::start(sfu_config).await {
+                Ok((handle, sfu_evt_rx)) => {
+                    info!("SFU enabled");
+
+                    // Spawn task to forward SFU events to Laravel
+                    let callback_url = config.bridge.callback_url.clone();
+                    tokio::spawn(forward_sfu_events(sfu_evt_rx, callback_url));
+
+                    Some(handle)
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to start SFU");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Bridge state
     let bridge_state = Arc::new(bridge::server::BridgeState {
         peer_manager: peer_manager.clone(),
+        sfu_handle,
         start_time: std::time::Instant::now(),
         node_name: config.node.name.clone(),
     });
@@ -84,4 +117,23 @@ async fn main() {
     }
 
     error!("inbound channel closed — shutting down");
+}
+
+/// Forward SFU events (SDP answers, etc.) to Laravel via the bridge callback.
+async fn forward_sfu_events(
+    mut sfu_evt_rx: mpsc::Receiver<SfuEvent>,
+    callback_url: String,
+) {
+    while let Some(event) = sfu_evt_rx.recv().await {
+        match event {
+            SfuEvent::SendMessage(msg) => {
+                if let Err(e) =
+                    bridge::callback::forward_to_laravel(&callback_url, "sfu", &msg).await
+                {
+                    warn!(error = %e, "failed to forward SFU event to Laravel");
+                }
+            }
+        }
+    }
+    info!("SFU event channel closed");
 }

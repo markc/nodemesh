@@ -21,3 +21,8 @@ port = 9800
 
 [log]
 level = "info"                     # Override: RUST_LOG=meshd=debug
+
+# WebRTC SFU (Phase 5) — selective forwarding unit via str0m
+# [sfu]
+# enabled = true
+# udp_bind = "0.0.0.0:9801"       # UDP port for WebRTC media

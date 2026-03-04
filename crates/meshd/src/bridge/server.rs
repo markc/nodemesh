@@ -1,18 +1,20 @@
-use amp::AmpMessage;
+use amp::{AmpAddress, AmpMessage};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
+use sfu::{SfuCommand, SfuHandle};
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::peer::manager::PeerManager;
 
 /// Shared state for bridge HTTP handlers.
 pub struct BridgeState {
     pub peer_manager: Arc<PeerManager>,
+    pub sfu_handle: Option<SfuHandle>,
     pub start_time: std::time::Instant,
     pub node_name: String,
 }
@@ -63,6 +65,37 @@ async fn handle_send(
 
     let msg_id = msg.get("id").unwrap_or("none").to_string();
 
+    // Check if this is an SFU command targeting the local node
+    if let Some(ref sfu_handle) = state.sfu_handle {
+        if SfuHandle::is_sfu_command(&msg) {
+            if let Some(to) = msg.to_addr() {
+                if let Some(addr) = AmpAddress::parse(to) {
+                    if addr.is_for_node(&state.node_name) {
+                        debug!(command = ?msg.command_name(), to = to, "routing to SFU");
+                        let cmd = SfuCommand::SdpOffer {
+                            request_id: msg_id.clone(),
+                            from_addr: msg.from_addr().unwrap_or("unknown").to_string(),
+                            to_addr: to.to_string(),
+                            sdp: msg.body.clone(),
+                        };
+                        return match sfu_handle.send(cmd).await {
+                            Ok(()) => (
+                                StatusCode::ACCEPTED,
+                                [("x-mesh-id", msg_id.as_str())],
+                                "accepted (sfu)",
+                            )
+                                .into_response(),
+                            Err(e) => {
+                                (StatusCode::INTERNAL_SERVER_ERROR, format!("sfu error: {e}"))
+                                    .into_response()
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
+
     match state.peer_manager.route(msg).await {
         Ok(()) => (
             StatusCode::ACCEPTED,
@@ -83,6 +116,7 @@ async fn handle_status(State(state): State<Arc<BridgeState>>) -> impl IntoRespon
         "node": state.node_name,
         "uptime_secs": uptime,
         "peers": peers,
+        "sfu_enabled": state.sfu_handle.is_some(),
     });
 
     axum::Json(status).into_response()

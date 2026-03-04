@@ -10,6 +10,7 @@ pub struct Config {
     pub peers: HashMap<String, PeerConfig>,
     #[serde(default)]
     pub log: LogConfig,
+    pub sfu: Option<SfuConfigToml>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +47,18 @@ impl Default for LogConfig {
             level: default_log_level(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SfuConfigToml {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_udp_bind")]
+    pub udp_bind: String,
+}
+
+fn default_udp_bind() -> String {
+    "0.0.0.0:9801".to_string()
 }
 
 fn default_listen() -> String {
