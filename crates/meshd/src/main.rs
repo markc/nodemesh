@@ -4,10 +4,12 @@ mod metrics;
 mod peer;
 mod server;
 
+use amp::AmpMessage;
 use config::Config;
 use peer::manager::PeerManager;
 use sfu::{SfuConfig, SfuEvent, SfuHandle};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -38,8 +40,8 @@ async fn main() {
         "meshd starting"
     );
 
-    // Channel for inbound messages from all peers → bridge callback
-    let (inbound_tx, mut inbound_rx) = mpsc::channel(1024);
+    // Channel for inbound messages from all peers → dispatcher
+    let (inbound_tx, inbound_rx) = mpsc::channel(1024);
 
     // Peer manager
     let peer_manager = Arc::new(PeerManager::new(
@@ -83,12 +85,18 @@ async fn main() {
         None
     };
 
+    // Channel for WS bridge registration
+    let (ws_bridge_tx, ws_bridge_rx) = mpsc::channel(1);
+    let ws_bridge_connected = Arc::new(AtomicBool::new(false));
+
     // Bridge state
     let bridge_state = Arc::new(bridge::server::BridgeState {
         peer_manager: peer_manager.clone(),
         sfu_handle,
         start_time: std::time::Instant::now(),
         node_name: config.node.name.clone(),
+        ws_bridge_tx,
+        ws_bridge_connected: ws_bridge_connected.clone(),
     });
 
     // Spawn bridge unix socket server
@@ -105,23 +113,83 @@ async fn main() {
         server::serve(&listen_addr, pm).await;
     });
 
-    // Main loop: forward inbound messages to Laravel
+    // Run the inbound message dispatcher
     let callback_url = config.bridge.callback_url.clone();
-    info!("meshd ready — forwarding inbound to {callback_url}");
+    info!("meshd ready — callback fallback: {callback_url}");
 
-    while let Some((peer_name, msg)) = inbound_rx.recv().await {
-        // Don't forward empty keepalive messages to Laravel
-        if msg.is_empty_message() {
-            continue;
-        }
+    dispatch_inbound(inbound_rx, ws_bridge_rx, ws_bridge_connected, &callback_url).await;
 
-        if let Err(e) = bridge::callback::forward_to_laravel(&callback_url, &peer_name, &msg).await
-        {
-            error!(peer = %peer_name, error = %e, "failed to forward to Laravel");
+    error!("dispatcher exited — shutting down");
+}
+
+/// Dispatch inbound peer messages to either the WS bridge or HTTP callback.
+///
+/// When a WS bridge connects, it sends a channel sender via ws_bridge_reg_rx.
+/// Messages route to that sender until the channel closes (bridge disconnects),
+/// then fall back to HTTP callback.
+async fn dispatch_inbound(
+    mut inbound_rx: mpsc::Receiver<(String, AmpMessage)>,
+    mut ws_bridge_reg_rx: mpsc::Receiver<mpsc::Sender<(String, AmpMessage)>>,
+    ws_connected: Arc<AtomicBool>,
+    callback_url: &str,
+) {
+    let mut ws_sink: Option<mpsc::Sender<(String, AmpMessage)>> = None;
+
+    loop {
+        tokio::select! {
+            // Check for WS bridge (dis)connection
+            reg = ws_bridge_reg_rx.recv() => {
+                match reg {
+                    Some(sender) => {
+                        info!("dispatcher: WS bridge registered");
+                        ws_sink = Some(sender);
+                    }
+                    None => {
+                        // Registration channel closed — bridge server gone
+                        break;
+                    }
+                }
+            }
+
+            // Forward inbound messages
+            msg = inbound_rx.recv() => {
+                match msg {
+                    Some((peer_name, amp_msg)) => {
+                        if amp_msg.is_empty_message() {
+                            continue;
+                        }
+
+                        // Try WS bridge first
+                        if let Some(ref tx) = ws_sink {
+                            if tx.send((peer_name.clone(), amp_msg.clone())).await.is_err() {
+                                // WS bridge disconnected
+                                info!("dispatcher: WS bridge disconnected, falling back to HTTP");
+                                ws_sink = None;
+                                ws_connected.store(false, Ordering::Relaxed);
+                                // Forward this message via HTTP callback
+                                if let Err(e) = bridge::callback::forward_to_laravel(
+                                    callback_url, &peer_name, &amp_msg,
+                                ).await {
+                                    error!(peer = %peer_name, error = %e, "callback forward failed");
+                                }
+                            }
+                        } else {
+                            // HTTP callback fallback
+                            if let Err(e) = bridge::callback::forward_to_laravel(
+                                callback_url, &peer_name, &amp_msg,
+                            ).await {
+                                error!(peer = %peer_name, error = %e, "callback forward failed");
+                            }
+                        }
+                    }
+                    None => {
+                        error!("inbound channel closed");
+                        break;
+                    }
+                }
+            }
         }
     }
-
-    error!("inbound channel closed — shutting down");
 }
 
 /// Forward SFU events (SDP answers, etc.) to Laravel via the bridge callback.
