@@ -1,11 +1,12 @@
-pub mod media;
+pub mod room;
 pub mod session;
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use amp::AmpMessage;
-use session::Session;
+use room::{Role, RoomRegistry};
+use session::{Session, SessionEvent};
 use str0m::net::Receive;
 use str0m::Input;
 use tokio::net::UdpSocket;
@@ -28,6 +29,10 @@ pub enum SfuCommand {
         from_addr: String,
         to_addr: String,
         sdp: String,
+        /// Room name (None = legacy loopback).
+        room: Option<String>,
+        /// Role string: "publisher" or "subscriber".
+        role: Option<String>,
     },
     /// Shut down the SFU.
     Shutdown,
@@ -101,6 +106,7 @@ async fn sfu_loop(
     evt_tx: mpsc::Sender<SfuEvent>,
 ) {
     let mut sessions: Vec<Session> = Vec::new();
+    let mut rooms = RoomRegistry::new();
     let mut buf = vec![0u8; 2000]; // MTU-sized buffer for UDP
 
     info!("SFU event loop running");
@@ -113,18 +119,27 @@ async fn sfu_loop(
             // Command from meshd (SDP offer, shutdown)
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(SfuCommand::SdpOffer { request_id, from_addr, to_addr, sdp }) => {
+                    Some(SfuCommand::SdpOffer { request_id, from_addr, to_addr, sdp, room, role }) => {
+                        let parsed_role = role.as_deref().and_then(Role::parse);
                         match session::Session::handle_sdp_offer(
                             &request_id, &from_addr, &to_addr, &sdp, local_addr,
+                            room.clone(), parsed_role,
                         ) {
                             Ok(result) => {
+                                let idx = sessions.len();
                                 sessions.push(result.session);
                                 if evt_tx.send(SfuEvent::SendMessage(result.answer_msg)).await.is_err() {
                                     warn!("event channel closed, shutting down SFU");
                                     break;
                                 }
+
+                                // Register in room if room/role specified
+                                if let (Some(ref room_name), Some(r)) = (&room, parsed_role) {
+                                    rooms.join(room_name, idx, r);
+                                }
+
                                 // Drain initial outputs from the new session
-                                drain_and_transmit(&socket, sessions.last_mut().unwrap()).await;
+                                drain_and_transmit(&socket, &mut sessions[idx]).await;
                             }
                             Err(e) => {
                                 error!(request_id = %request_id, error = %e, "SDP offer handling failed");
@@ -160,7 +175,13 @@ async fn sfu_loop(
                             if let Err(e) = sessions[i].handle_input(input) {
                                 warn!(session = %sessions[i].id, error = %e, "input handling failed");
                             }
-                            drain_and_transmit(&socket, &mut sessions[i]).await;
+                            let (transmits, events, _timeout) = sessions[i].drain_outputs(now);
+                            for t in transmits {
+                                if let Err(e) = socket.send_to(&t.data, t.dest).await {
+                                    debug!(dest = %t.dest, error = %e, "UDP send failed");
+                                }
+                            }
+                            process_events(i, events, &mut sessions, &rooms, &socket).await;
                         } else {
                             debug!(source = %source, len, "no session for UDP packet");
                         }
@@ -174,29 +195,148 @@ async fn sfu_loop(
             // Timeout: drive sessions forward
             _ = tokio::time::sleep(timeout_duration) => {
                 let now = Instant::now();
-                for session in &mut sessions {
+                // Collect all events from all sessions first, then process
+                let mut all_events: Vec<(usize, Vec<SessionEvent>)> = Vec::new();
+                for (i, session) in sessions.iter_mut().enumerate() {
                     if let Err(e) = session.handle_input(Input::Timeout(now)) {
                         warn!(session = %session.id, error = %e, "timeout handling failed");
                     }
-                    drain_and_transmit(&socket, session).await;
+                    let (transmits, events, _timeout) = session.drain_outputs(now);
+                    for t in transmits {
+                        if let Err(e) = socket.send_to(&t.data, t.dest).await {
+                            debug!(dest = %t.dest, error = %e, "UDP send failed");
+                        }
+                    }
+                    if !events.is_empty() {
+                        all_events.push((i, events));
+                    }
+                }
+                for (source_idx, events) in all_events {
+                    process_events(source_idx, events, &mut sessions, &rooms, &socket).await;
                 }
             }
         }
 
-        // Clean up dead sessions
-        let before = sessions.len();
-        sessions.retain(|s| s.is_alive());
-        let removed = before - sessions.len();
-        if removed > 0 {
-            info!(removed, remaining = sessions.len(), "cleaned up dead sessions");
+        // Clean up dead sessions (manual loop for index adjustment in rooms)
+        let mut i = 0;
+        while i < sessions.len() {
+            if !sessions[i].is_alive() {
+                info!(session = %sessions[i].id, "removing dead session");
+                sessions.remove(i);
+                rooms.remove_session(i);
+                // Don't increment i — next session is now at i
+            } else {
+                i += 1;
+            }
         }
     }
 }
 
-/// Drain outputs from a session and transmit UDP packets.
+/// Process session events for room-based fanout.
+///
+/// For each MediaData event from a publisher, find the room and write media
+/// to all subscribers. For KeyframeRequest events from subscribers, forward
+/// to the publisher.
+async fn process_events(
+    source_idx: usize,
+    events: Vec<SessionEvent>,
+    sessions: &mut Vec<Session>,
+    rooms: &RoomRegistry,
+    socket: &UdpSocket,
+) {
+    for event in events {
+        match event {
+            SessionEvent::MediaData(data) => {
+                // Determine the media kind from the source session's mid_by_kind
+                let kind = sessions[source_idx]
+                    .mid_by_kind
+                    .iter()
+                    .find(|(_, &mid)| mid == data.mid)
+                    .map(|(&k, _)| k);
+
+                let Some(kind) = kind else {
+                    debug!(session = %sessions[source_idx].id, mid = ?data.mid, "no kind for mid");
+                    continue;
+                };
+
+                // Find the room where this session is publisher
+                let Some(room) = rooms.find_publisher_room(source_idx) else {
+                    continue;
+                };
+
+                // Forward to each subscriber
+                for &sub_idx in &room.subscribers {
+                    if sub_idx >= sessions.len() {
+                        continue;
+                    }
+                    let Some(&sub_mid) = sessions[sub_idx].mid_by_kind.get(&kind) else {
+                        continue;
+                    };
+                    let Some(writer) = sessions[sub_idx].rtc.writer(sub_mid) else {
+                        continue;
+                    };
+                    let Some(pt) = writer.match_params(data.params.clone()) else {
+                        debug!(sub_idx, "no matching PT for subscriber");
+                        continue;
+                    };
+                    if let Err(e) = writer.write(pt, data.network_time, data.time, data.data.clone()) {
+                        debug!(sub_idx, error = %e, "fanout write failed");
+                    }
+
+                    // Drain subscriber outputs after writing
+                    let now = Instant::now();
+                    let (transmits, _events, _timeout) = sessions[sub_idx].drain_outputs(now);
+                    for t in transmits {
+                        if let Err(e) = socket.send_to(&t.data, t.dest).await {
+                            debug!(dest = %t.dest, error = %e, "UDP send failed");
+                        }
+                    }
+                }
+            }
+            SessionEvent::KeyframeRequest(req) => {
+                // Subscriber requests keyframe → forward to publisher in same room
+                // Find which room this subscriber is in
+                for room in rooms.rooms.values() {
+                    if !room.subscribers.contains(&source_idx) {
+                        continue;
+                    }
+                    let Some(pub_idx) = room.publisher else {
+                        continue;
+                    };
+                    if pub_idx >= sessions.len() {
+                        continue;
+                    }
+
+                    // Determine the kind from the subscriber's mid_by_kind
+                    let kind = sessions[source_idx]
+                        .mid_by_kind
+                        .iter()
+                        .find(|(_, &mid)| mid == req.mid)
+                        .map(|(&k, _)| k);
+
+                    let Some(kind) = kind else {
+                        continue;
+                    };
+                    let Some(&pub_mid) = sessions[pub_idx].mid_by_kind.get(&kind) else {
+                        continue;
+                    };
+
+                    if let Some(mut writer) = sessions[pub_idx].rtc.writer(pub_mid) {
+                        if let Err(e) = writer.request_keyframe(None, req.kind) {
+                            debug!(pub_idx, error = %e, "keyframe forward failed");
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Drain outputs from a session and transmit UDP packets (for non-room paths).
 async fn drain_and_transmit(socket: &UdpSocket, session: &mut Session) {
     let now = Instant::now();
-    let (transmits, _timeout) = session.drain_outputs(now);
+    let (transmits, _events, _timeout) = session.drain_outputs(now);
     for t in transmits {
         if let Err(e) = socket.send_to(&t.data, t.dest).await {
             debug!(dest = %t.dest, error = %e, "UDP send failed");

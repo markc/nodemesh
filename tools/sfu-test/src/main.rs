@@ -81,10 +81,28 @@ async fn signal_offer(
     // Pre-register the pending slot so the callback can fill it
     pending.write().await.insert(request_id.clone(), String::new());
 
-    // Wrap in AMP message — str0m's JSON format matches browser format exactly
-    let amp_wire = format!(
-        "---\namp: 1\ntype: request\ncommand: sdp-offer\nfrom: browser.{NODE_NAME}.amp\nto: sfu.{NODE_NAME}.amp\nid: {request_id}\n---\n{body}\n"
+    // Extract optional room/role from the JSON
+    let room = sdp_value.get("room").and_then(|v| v.as_str()).unwrap_or("");
+    let role = sdp_value.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Build AMP headers — include room/role if present
+    let mut headers = format!(
+        "---\namp: 1\ntype: request\ncommand: sdp-offer\nfrom: browser.{NODE_NAME}.amp\nto: sfu.{NODE_NAME}.amp\nid: {request_id}"
     );
+    if !room.is_empty() {
+        headers.push_str(&format!("\nroom: {room}"));
+    }
+    if !role.is_empty() {
+        headers.push_str(&format!("\nrole: {role}"));
+    }
+    headers.push_str("\n---\n");
+
+    // Strip room/role from the SDP JSON body (only pass type+sdp to str0m)
+    let sdp_body = serde_json::json!({
+        "type": sdp_value["type"],
+        "sdp": sdp_value["sdp"],
+    });
+    let amp_wire = format!("{headers}{sdp_body}\n");
 
     // Forward to meshd via unix socket
     match send_to_meshd(&amp_wire).await {

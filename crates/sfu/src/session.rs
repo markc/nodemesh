@@ -1,10 +1,14 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use amp::AmpMessage;
 use str0m::change::SdpOffer;
+use str0m::media::{KeyframeRequest, MediaKind, Mid};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 use tracing::{debug, info, warn};
+
+use crate::room::Role;
 
 /// Detect the machine's default local IP by UDP-connecting to a public address.
 /// This doesn't send any packets — it just lets the OS pick the outgoing interface.
@@ -14,14 +18,27 @@ pub fn detect_local_ip() -> IpAddr {
     socket.local_addr().expect("local_addr").ip()
 }
 
+/// Events collected during session drain, processed by the event loop for fanout.
+pub enum SessionEvent {
+    /// Media data from a publisher to forward to subscribers.
+    MediaData(str0m::media::MediaData),
+    /// Keyframe request from a subscriber to forward to the publisher.
+    KeyframeRequest(KeyframeRequest),
+}
+
 /// A WebRTC session wrapping a str0m Rtc instance.
 ///
 /// Each session corresponds to one browser peer connection.
-/// In Phase 5a (loopback), received media is echoed back to the sender.
 pub struct Session {
     pub id: String,
     pub from_addr: String,
     pub rtc: Rtc,
+    /// Room name (None = legacy loopback mode).
+    pub room: Option<String>,
+    /// Role within the room.
+    pub role: Option<Role>,
+    /// Map from MediaKind to Mid, built from MediaAdded events.
+    pub mid_by_kind: HashMap<MediaKind, Mid>,
     alive: bool,
 }
 
@@ -38,15 +55,18 @@ pub struct Transmit {
 }
 
 impl Session {
-    /// Process an SDP offer and create a new session with loopback media.
+    /// Process an SDP offer and create a new session.
     ///
-    /// Returns the session and an AMP message containing the SDP answer.
+    /// If room/role are provided, the session participates in room-based fanout.
+    /// If None, the session operates in legacy loopback mode.
     pub fn handle_sdp_offer(
         request_id: &str,
         from_addr: &str,
         to_addr: &str,
         sdp_json: &str,
         local_addr: SocketAddr,
+        room: Option<String>,
+        role: Option<Role>,
     ) -> Result<OfferResult, String> {
         let offer: SdpOffer =
             serde_json::from_str(sdp_json).map_err(|e| format!("invalid SDP offer JSON: {e}"))?;
@@ -92,12 +112,17 @@ impl Session {
             id: request_id.to_string(),
             from_addr: from_addr.to_string(),
             rtc,
+            room,
+            role,
+            mid_by_kind: HashMap::new(),
             alive: true,
         };
 
         info!(
             session_id = request_id,
             from = from_addr,
+            room = ?session.room,
+            role = ?session.role,
             "SDP offer accepted, session created"
         );
 
@@ -119,11 +144,16 @@ impl Session {
             .map_err(|e| format!("handle_input: {e}"))
     }
 
-    /// Drive the session forward: poll outputs, handle events, loopback media.
+    /// Drive the session forward: poll outputs, handle events.
     ///
-    /// Returns UDP packets to transmit and the next timeout deadline.
-    pub fn drain_outputs(&mut self, now: Instant) -> (Vec<Transmit>, Option<Instant>) {
+    /// Returns UDP packets to transmit, collected session events (for room fanout),
+    /// and the next timeout deadline.
+    pub fn drain_outputs(
+        &mut self,
+        now: Instant,
+    ) -> (Vec<Transmit>, Vec<SessionEvent>, Option<Instant>) {
         let mut transmits = Vec::new();
+        let mut events = Vec::new();
         let mut next_timeout = None;
 
         loop {
@@ -147,7 +177,9 @@ impl Session {
                     });
                 }
                 Ok(Output::Event(event)) => {
-                    self.handle_event(event);
+                    if let Some(session_event) = self.handle_event(event) {
+                        events.push(session_event);
+                    }
                 }
                 Err(e) => {
                     warn!(session = %self.id, error = %e, "poll_output error");
@@ -157,48 +189,66 @@ impl Session {
             }
         }
 
-        (transmits, next_timeout)
+        (transmits, events, next_timeout)
     }
 
-    /// Handle a str0m event — loopback media, log state changes.
-    fn handle_event(&mut self, event: Event) {
+    /// Handle a str0m event.
+    ///
+    /// For room sessions: returns SessionEvent for fanout processing.
+    /// For loopback sessions (no room): handles media locally, returns None.
+    fn handle_event(&mut self, event: Event) -> Option<SessionEvent> {
         match event {
             Event::IceConnectionStateChange(state) => {
                 info!(session = %self.id, ?state, "ICE state changed");
                 if state == IceConnectionState::Disconnected {
                     self.alive = false;
                 }
+                None
             }
             Event::Connected => {
                 info!(session = %self.id, "WebRTC connected");
+                None
             }
             Event::MediaAdded(media) => {
-                debug!(session = %self.id, mid = ?media.mid, "media added");
+                debug!(session = %self.id, mid = ?media.mid, kind = ?media.kind, "media added");
+                self.mid_by_kind.insert(media.kind, media.mid);
+                None
             }
             Event::MediaData(data) => {
-                // Loopback: write received media back to the same Rtc
-                let mid = data.mid;
-                let pt = data.pt;
-                let time = data.time;
-                let payload = data.data.clone();
-                let now = Instant::now();
-
-                if let Some(writer) = self.rtc.writer(mid) {
-                    if let Err(e) = writer.write(pt, now, time, payload) {
-                        debug!(session = %self.id, ?mid, error = %e, "loopback write failed");
+                if self.room.is_some() {
+                    // Room mode: return event for fanout
+                    Some(SessionEvent::MediaData(data))
+                } else {
+                    // Legacy loopback: echo media back
+                    let mid = data.mid;
+                    let pt = data.pt;
+                    let time = data.time;
+                    let payload = data.data.clone();
+                    let now = Instant::now();
+                    if let Some(writer) = self.rtc.writer(mid) {
+                        if let Err(e) = writer.write(pt, now, time, payload) {
+                            debug!(session = %self.id, ?mid, error = %e, "loopback write failed");
+                        }
                     }
+                    None
                 }
             }
             Event::KeyframeRequest(req) => {
-                debug!(session = %self.id, mid = ?req.mid, "keyframe requested");
-                // In loopback, request a keyframe from the sender via the writer
-                if let Some(mut writer) = self.rtc.writer(req.mid) {
-                    if let Err(e) = writer.request_keyframe(None, req.kind) {
-                        debug!(session = %self.id, error = %e, "keyframe request failed");
+                if self.room.is_some() {
+                    // Room mode: return event for fanout
+                    Some(SessionEvent::KeyframeRequest(req))
+                } else {
+                    // Legacy loopback
+                    debug!(session = %self.id, mid = ?req.mid, "keyframe requested");
+                    if let Some(mut writer) = self.rtc.writer(req.mid) {
+                        if let Err(e) = writer.request_keyframe(None, req.kind) {
+                            debug!(session = %self.id, error = %e, "keyframe request failed");
+                        }
                     }
+                    None
                 }
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -211,7 +261,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use str0m::media::{Direction, MediaKind};
+    use str0m::media::Direction;
 
     /// Generate a synthetic SDP offer JSON from a client Rtc with audio+video.
     fn make_client_offer() -> (Rtc, String) {
@@ -241,6 +291,8 @@ mod tests {
             "sfu.cachyos.amp",
             &offer_json,
             local_addr,
+            None,
+            None,
         )
         .expect("handle_sdp_offer should succeed");
 
@@ -265,6 +317,26 @@ mod tests {
     }
 
     #[test]
+    fn handle_sdp_offer_with_room() {
+        let (_client, offer_json) = make_client_offer();
+        let local_addr: SocketAddr = "127.0.0.1:9801".parse().unwrap();
+
+        let result = Session::handle_sdp_offer(
+            "req-room-001",
+            "browser.cachyos.amp",
+            "sfu.cachyos.amp",
+            &offer_json,
+            local_addr,
+            Some("test-room".to_string()),
+            Some(Role::Publisher),
+        )
+        .expect("handle_sdp_offer should succeed");
+
+        assert_eq!(result.session.room, Some("test-room".to_string()));
+        assert_eq!(result.session.role, Some(Role::Publisher));
+    }
+
+    #[test]
     fn handle_sdp_offer_rejects_invalid_json() {
         let local_addr: SocketAddr = "127.0.0.1:9801".parse().unwrap();
         let result = Session::handle_sdp_offer(
@@ -273,6 +345,8 @@ mod tests {
             "sfu.cachyos.amp",
             "not valid json",
             local_addr,
+            None,
+            None,
         );
         assert!(result.is_err());
     }
@@ -288,15 +362,16 @@ mod tests {
             "sfu.cachyos.amp",
             &offer_json,
             local_addr,
+            None,
+            None,
         )
         .unwrap();
 
         let now = Instant::now();
-        let (transmits, timeout) = result.session.drain_outputs(now);
+        let (transmits, _events, timeout) = result.session.drain_outputs(now);
 
         // Should have a timeout (session waiting for ICE)
         assert!(timeout.is_some());
-        // May or may not have transmits at this point
         // Session should still be alive
         assert!(result.session.is_alive());
 

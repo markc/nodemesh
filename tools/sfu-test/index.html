@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>SFU Loopback Test</title>
+<title>SFU Room Test</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 2rem; }
@@ -18,18 +18,29 @@
   #status { margin: 1rem 0; padding: 1rem; background: #16213e; border-radius: 8px;
             font-family: monospace; font-size: 0.85rem; white-space: pre-wrap;
             max-height: 300px; overflow-y: auto; }
-  .controls { display: flex; gap: 1rem; align-items: center; }
+  .controls { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+  input, select { padding: 0.5rem; font-size: 1rem; border-radius: 6px; border: 1px solid #333;
+                  background: #16213e; color: #e0e0e0; }
+  label { font-size: 0.9rem; color: #aaa; }
 </style>
 </head>
 <body>
 
-<h1>WebRTC SFU Loopback Test</h1>
+<h1>WebRTC SFU Room Test</h1>
 
 <div class="controls">
-  <button id="micBtn" onclick="startLoopback('mic')">Mic Only</button>
-  <button id="camBtn" onclick="startLoopback('camera')">Camera + Mic</button>
-  <button id="screenBtn" onclick="startLoopback('screen')">Share Screen</button>
-  <button id="stopBtn" onclick="stopLoopback()" disabled>Stop</button>
+  <label>Room: <input id="roomInput" type="text" value="test-room" size="12"></label>
+  <label>Mode:
+    <select id="modeSelect">
+      <option value="camera">Camera + Mic</option>
+      <option value="screen">Screen Share</option>
+      <option value="mic">Mic Only</option>
+    </select>
+  </label>
+  <button id="pubBtn" onclick="startPublish()">Publish</button>
+  <button id="subBtn" onclick="startSubscribe()">Subscribe</button>
+  <button id="loopBtn" onclick="startLoopback()">Loopback (no room)</button>
+  <button id="stopBtn" onclick="stop()" disabled>Stop</button>
 </div>
 
 <div class="videos">
@@ -38,12 +49,12 @@
     <video id="localVideo" autoplay muted playsinline></video>
   </div>
   <div class="video-box">
-    <h3>Remote (loopback from SFU)</h3>
+    <h3 id="remoteLabel">Remote</h3>
     <video id="remoteVideo" autoplay playsinline></video>
   </div>
 </div>
 
-<div id="status">Ready. Click "Start Loopback" to begin.</div>
+<div id="status">Ready. Publish to send media, Subscribe to receive, or Loopback for echo test.</div>
 
 <script>
 let pc = null;
@@ -56,140 +67,213 @@ function log(msg) {
   el.scrollTop = el.scrollHeight;
 }
 
-async function startLoopback(mode) {
-  document.getElementById('micBtn').disabled = true;
-  document.getElementById('camBtn').disabled = true;
-  document.getElementById('screenBtn').disabled = true;
-  document.getElementById('stopBtn').disabled = false;
+function setButtonsDisabled(disabled) {
+  document.getElementById('pubBtn').disabled = disabled;
+  document.getElementById('subBtn').disabled = disabled;
+  document.getElementById('loopBtn').disabled = disabled;
+  document.getElementById('stopBtn').disabled = !disabled;
+}
 
-  try {
-    // Get media based on mode
-    if (mode === 'screen') {
-      log('Requesting screen share...');
-      localStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,  // system audio (browser will ask)
-      });
-      document.getElementById('localLabel').textContent = 'Local (screen)';
-    } else if (mode === 'camera') {
-      log('Requesting camera and microphone...');
-      try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      } catch (e) {
-        log('No camera, trying audio-only: ' + e.message);
-        localStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
-      }
+async function getLocalMedia(mode) {
+  if (mode === 'screen') {
+    log('Requesting screen share...');
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    document.getElementById('localLabel').textContent = 'Local (screen)';
+    return stream;
+  } else if (mode === 'camera') {
+    log('Requesting camera and microphone...');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       document.getElementById('localLabel').textContent = 'Local (camera)';
-    } else {
-      log('Requesting microphone...');
-      localStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+      return stream;
+    } catch (e) {
+      log('No camera, trying audio-only: ' + e.message);
+      const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
       document.getElementById('localLabel').textContent = 'Local (mic)';
+      return stream;
     }
-    document.getElementById('localVideo').srcObject = localStream;
-    log('Got local media: ' + localStream.getTracks().map(t => t.kind).join(', '));
-
-    // Create peer connection
-    pc = new RTCPeerConnection({ iceServers: [] });
-
-    pc.oniceconnectionstatechange = () => {
-      log('ICE: ' + pc.iceConnectionState);
-    };
-    pc.onconnectionstatechange = () => {
-      log('Connection: ' + pc.connectionState);
-    };
-    pc.ontrack = (event) => {
-      log('Remote track received: ' + event.track.kind);
-      document.getElementById('remoteVideo').srcObject = event.streams[0];
-    };
-
-    // Add local tracks
-    for (const track of localStream.getTracks()) {
-      pc.addTrack(track, localStream);
-    }
-
-    // Create offer
-    log('Creating SDP offer...');
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    // Wait for ICE gathering to complete (or timeout after 2s)
-    if (pc.iceGatheringState !== 'complete') {
-      log('Waiting for ICE candidates...');
-      await new Promise((resolve) => {
-        const timeout = setTimeout(resolve, 2000);
-        pc.onicegatheringstatechange = () => {
-          if (pc.iceGatheringState === 'complete') {
-            clearTimeout(timeout);
-            resolve();
-          }
-        };
-      });
-    }
-
-    // Send the complete offer (with ICE candidates)
-    const completeOffer = pc.localDescription;
-    log('Sending SDP offer (' + completeOffer.sdp.length + ' bytes)...');
-
-    const resp = await fetch('/signal', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: completeOffer.type, sdp: completeOffer.sdp }),
-    });
-
-    if (!resp.ok) {
-      throw new Error('Signal POST failed: ' + resp.status + ' ' + await resp.text());
-    }
-
-    const { request_id } = await resp.json();
-    log('Offer sent, request_id: ' + request_id);
-
-    // Poll for answer
-    log('Polling for SDP answer...');
-    const answer = await pollForAnswer(request_id);
-    log('Got SDP answer (' + answer.sdp.length + ' bytes)');
-
-    // Set remote description
-    await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    log('Remote description set. Waiting for media...');
-
-  } catch (err) {
-    log('ERROR: ' + err.message);
-    stopLoopback();
+  } else {
+    log('Requesting microphone...');
+    const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+    document.getElementById('localLabel').textContent = 'Local (mic)';
+    return stream;
   }
+}
+
+function createPeerConnection() {
+  const conn = new RTCPeerConnection({ iceServers: [] });
+  conn.oniceconnectionstatechange = () => log('ICE: ' + conn.iceConnectionState);
+  conn.onconnectionstatechange = () => log('Connection: ' + conn.connectionState);
+  conn.ontrack = (event) => {
+    log('Remote track received: ' + event.track.kind);
+    document.getElementById('remoteVideo').srcObject = event.streams[0] || new MediaStream([event.track]);
+  };
+  return conn;
+}
+
+async function waitForIce(conn) {
+  if (conn.iceGatheringState !== 'complete') {
+    log('Waiting for ICE candidates...');
+    await new Promise((resolve) => {
+      const timeout = setTimeout(resolve, 2000);
+      conn.onicegatheringstatechange = () => {
+        if (conn.iceGatheringState === 'complete') {
+          clearTimeout(timeout);
+          resolve();
+        }
+      };
+    });
+  }
+}
+
+async function sendOffer(sdp, room, role) {
+  const body = { type: sdp.type, sdp: sdp.sdp };
+  if (room) body.room = room;
+  if (role) body.role = role;
+
+  const resp = await fetch('/signal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    throw new Error('Signal POST failed: ' + resp.status + ' ' + await resp.text());
+  }
+  return await resp.json();
 }
 
 async function pollForAnswer(requestId) {
   const maxAttempts = 30;
   for (let i = 0; i < maxAttempts; i++) {
     const resp = await fetch('/signal/' + requestId);
-    if (resp.status === 200) {
-      return await resp.json();
-    }
-    if (resp.status === 404) {
-      throw new Error('Unknown request_id');
-    }
-    // 202 = still pending
+    if (resp.status === 200) return await resp.json();
+    if (resp.status === 404) throw new Error('Unknown request_id');
     await new Promise(r => setTimeout(r, 200));
   }
   throw new Error('Timeout waiting for SDP answer');
 }
 
-function stopLoopback() {
-  if (pc) {
-    pc.close();
-    pc = null;
+async function startPublish() {
+  setButtonsDisabled(true);
+  const room = document.getElementById('roomInput').value.trim();
+  const mode = document.getElementById('modeSelect').value;
+  if (!room) { log('ERROR: room name required'); setButtonsDisabled(false); return; }
+
+  try {
+    localStream = await getLocalMedia(mode);
+    document.getElementById('localVideo').srcObject = localStream;
+    log('Got local media: ' + localStream.getTracks().map(t => t.kind).join(', '));
+
+    pc = createPeerConnection();
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
+    }
+
+    log('Creating SDP offer (publisher)...');
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIce(pc);
+
+    const completeOffer = pc.localDescription;
+    log('Sending SDP offer (' + completeOffer.sdp.length + ' bytes)...');
+    const { request_id } = await sendOffer(completeOffer, room, 'publisher');
+    log('Offer sent, request_id: ' + request_id);
+
+    log('Polling for SDP answer...');
+    const answer = await pollForAnswer(request_id);
+    log('Got SDP answer (' + answer.sdp.length + ' bytes)');
+
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    document.getElementById('remoteLabel').textContent = 'Remote (publishing to: ' + room + ')';
+    log('Publishing to room: ' + room);
+  } catch (err) {
+    log('ERROR: ' + err.message);
+    stop();
   }
-  if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-    localStream = null;
+}
+
+async function startSubscribe() {
+  setButtonsDisabled(true);
+  const room = document.getElementById('roomInput').value.trim();
+  if (!room) { log('ERROR: room name required'); setButtonsDisabled(false); return; }
+
+  try {
+    pc = createPeerConnection();
+
+    // Add recvonly transceivers for audio and video
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+    pc.addTransceiver('video', { direction: 'recvonly' });
+
+    log('Creating SDP offer (subscriber)...');
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIce(pc);
+
+    const completeOffer = pc.localDescription;
+    log('Sending SDP offer (' + completeOffer.sdp.length + ' bytes)...');
+    const { request_id } = await sendOffer(completeOffer, room, 'subscriber');
+    log('Offer sent, request_id: ' + request_id);
+
+    log('Polling for SDP answer...');
+    const answer = await pollForAnswer(request_id);
+    log('Got SDP answer (' + answer.sdp.length + ' bytes)');
+
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    document.getElementById('remoteLabel').textContent = 'Remote (subscribed to: ' + room + ')';
+    document.getElementById('localLabel').textContent = 'Local (subscriber — no media)';
+    log('Subscribed to room: ' + room + '. Waiting for media...');
+  } catch (err) {
+    log('ERROR: ' + err.message);
+    stop();
   }
+}
+
+async function startLoopback() {
+  setButtonsDisabled(true);
+  const mode = document.getElementById('modeSelect').value;
+
+  try {
+    localStream = await getLocalMedia(mode);
+    document.getElementById('localVideo').srcObject = localStream;
+    log('Got local media: ' + localStream.getTracks().map(t => t.kind).join(', '));
+
+    pc = createPeerConnection();
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
+    }
+
+    log('Creating SDP offer (loopback)...');
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIce(pc);
+
+    const completeOffer = pc.localDescription;
+    log('Sending SDP offer (' + completeOffer.sdp.length + ' bytes)...');
+    const { request_id } = await sendOffer(completeOffer, null, null);
+    log('Offer sent, request_id: ' + request_id);
+
+    log('Polling for SDP answer...');
+    const answer = await pollForAnswer(request_id);
+    log('Got SDP answer (' + answer.sdp.length + ' bytes)');
+
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    document.getElementById('remoteLabel').textContent = 'Remote (loopback from SFU)';
+    log('Loopback mode. Waiting for media...');
+  } catch (err) {
+    log('ERROR: ' + err.message);
+    stop();
+  }
+}
+
+function stop() {
+  if (pc) { pc.close(); pc = null; }
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   document.getElementById('localVideo').srcObject = null;
   document.getElementById('remoteVideo').srcObject = null;
-  document.getElementById('micBtn').disabled = false;
-  document.getElementById('camBtn').disabled = false;
-  document.getElementById('screenBtn').disabled = false;
   document.getElementById('localLabel').textContent = 'Local';
-  document.getElementById('stopBtn').disabled = true;
+  document.getElementById('remoteLabel').textContent = 'Remote';
+  setButtonsDisabled(false);
   log('Stopped.');
 }
 </script>

@@ -1,5 +1,5 @@
 use amp::AmpMessage;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 /// Forward inbound AMP messages from peers to Laravel via HTTP POST.
 pub async fn forward_to_laravel(

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::connect_async;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::PeerConfig;
 use crate::peer::connection;

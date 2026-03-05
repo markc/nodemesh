@@ -77,6 +77,8 @@ async fn handle_send(
                             from_addr: msg.from_addr().unwrap_or("unknown").to_string(),
                             to_addr: to.to_string(),
                             sdp: msg.body.clone(),
+                            room: msg.get("room").map(|s| s.to_string()),
+                            role: msg.get("role").map(|s| s.to_string()),
                         };
                         return match sfu_handle.send(cmd).await {
                             Ok(()) => (

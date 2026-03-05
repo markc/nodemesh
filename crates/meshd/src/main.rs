@@ -110,6 +110,11 @@ async fn main() {
     info!("meshd ready — forwarding inbound to {callback_url}");
 
     while let Some((peer_name, msg)) = inbound_rx.recv().await {
+        // Don't forward empty keepalive messages to Laravel
+        if msg.is_empty_message() {
+            continue;
+        }
+
         if let Err(e) = bridge::callback::forward_to_laravel(&callback_url, &peer_name, &msg).await
         {
             error!(peer = %peer_name, error = %e, "failed to forward to Laravel");
