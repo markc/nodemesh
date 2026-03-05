@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -67,9 +67,11 @@ async fn main() {
                 Ok((handle, sfu_evt_rx)) => {
                     info!("SFU enabled");
 
-                    // Spawn task to forward SFU events to Laravel
+                    // Spawn task to forward SFU events to Laravel and peers
                     let callback_url = config.bridge.callback_url.clone();
-                    tokio::spawn(forward_sfu_events(sfu_evt_rx, callback_url));
+                    let pm = peer_manager.clone();
+                    let nn = config.node.name.clone();
+                    tokio::spawn(forward_sfu_events(sfu_evt_rx, callback_url, pm, nn));
 
                     Some(handle)
                 }
@@ -88,6 +90,9 @@ async fn main() {
     // Channel for WS bridge registration
     let (ws_bridge_tx, ws_bridge_rx) = mpsc::channel(1);
     let ws_bridge_connected = Arc::new(AtomicBool::new(false));
+
+    // Clone SFU handle for the dispatcher (before moving into bridge_state)
+    let sfu_handle_for_dispatch = sfu_handle.clone();
 
     // Bridge state
     let bridge_state = Arc::new(bridge::server::BridgeState {
@@ -117,21 +122,20 @@ async fn main() {
     let callback_url = config.bridge.callback_url.clone();
     info!("meshd ready — callback fallback: {callback_url}");
 
-    dispatch_inbound(inbound_rx, ws_bridge_rx, ws_bridge_connected, &callback_url).await;
+    dispatch_inbound(inbound_rx, ws_bridge_rx, ws_bridge_connected, &callback_url, sfu_handle_for_dispatch).await;
 
     error!("dispatcher exited — shutting down");
 }
 
 /// Dispatch inbound peer messages to either the WS bridge or HTTP callback.
-///
-/// When a WS bridge connects, it sends a channel sender via ws_bridge_reg_rx.
-/// Messages route to that sender until the channel closes (bridge disconnects),
-/// then fall back to HTTP callback.
+/// Relay commands (relay-subscribe, relay-unsubscribe, relay-data) from peers
+/// are intercepted and sent to the local SFU.
 async fn dispatch_inbound(
     mut inbound_rx: mpsc::Receiver<(String, AmpMessage)>,
     mut ws_bridge_reg_rx: mpsc::Receiver<mpsc::Sender<(String, AmpMessage)>>,
     ws_connected: Arc<AtomicBool>,
     callback_url: &str,
+    sfu_handle: Option<sfu::SfuHandle>,
 ) {
     let mut ws_sink: Option<mpsc::Sender<(String, AmpMessage)>> = None;
 
@@ -157,6 +161,19 @@ async fn dispatch_inbound(
                     Some((peer_name, amp_msg)) => {
                         if amp_msg.is_empty_message() {
                             continue;
+                        }
+
+                        // Intercept relay commands destined for local SFU
+                        if let Some(ref sfu) = sfu_handle {
+                            if sfu::SfuHandle::is_sfu_command(&amp_msg) {
+                                if let Some(cmd) = sfu::SfuHandle::parse_command(&amp_msg) {
+                                    debug!(peer = %peer_name, cmd = ?amp_msg.command_name(), "routing inbound to SFU");
+                                    if let Err(e) = sfu.send(cmd).await {
+                                        warn!(error = %e, "failed to send relay command to SFU");
+                                    }
+                                    continue;
+                                }
+                            }
                         }
 
                         // Try WS bridge first
@@ -192,10 +209,12 @@ async fn dispatch_inbound(
     }
 }
 
-/// Forward SFU events (SDP answers, etc.) to Laravel via the bridge callback.
+/// Forward SFU events (SDP answers, relay commands, etc.) to Laravel or peers.
 async fn forward_sfu_events(
     mut sfu_evt_rx: mpsc::Receiver<SfuEvent>,
     callback_url: String,
+    peer_manager: Arc<PeerManager>,
+    node_name: String,
 ) {
     while let Some(event) = sfu_evt_rx.recv().await {
         match event {
@@ -204,6 +223,53 @@ async fn forward_sfu_events(
                     bridge::callback::forward_to_laravel(&callback_url, "sfu", &msg).await
                 {
                     warn!(error = %e, "failed to forward SFU event to Laravel");
+                }
+            }
+            SfuEvent::RequestRelay { target_node, room } => {
+                let msg = AmpMessage::command([
+                    ("amp", "1".to_string()),
+                    ("type", "request".to_string()),
+                    ("command", "relay-subscribe".to_string()),
+                    ("from", format!("sfu.{node_name}.amp")),
+                    ("to", format!("sfu.{target_node}.amp")),
+                    ("room", room),
+                    ("from-node", node_name.clone()),
+                ]);
+                if let Err(e) = peer_manager.send_to(&target_node, msg).await {
+                    warn!(target = %target_node, error = %e, "relay-subscribe send failed");
+                }
+            }
+            SfuEvent::CancelRelay { target_node, room } => {
+                let msg = AmpMessage::command([
+                    ("amp", "1".to_string()),
+                    ("type", "request".to_string()),
+                    ("command", "relay-unsubscribe".to_string()),
+                    ("from", format!("sfu.{node_name}.amp")),
+                    ("to", format!("sfu.{target_node}.amp")),
+                    ("room", room),
+                    ("from-node", node_name.clone()),
+                ]);
+                if let Err(e) = peer_manager.send_to(&target_node, msg).await {
+                    warn!(target = %target_node, error = %e, "relay-unsubscribe send failed");
+                }
+            }
+            SfuEvent::RelayData { target_node, packet } => {
+                let body = serde_json::to_string(&packet).unwrap_or_default();
+                let msg = AmpMessage::new(
+                    [
+                        ("amp".to_string(), "1".to_string()),
+                        ("type".to_string(), "stream".to_string()),
+                        ("command".to_string(), "relay-data".to_string()),
+                        ("from".to_string(), format!("sfu.{node_name}.amp")),
+                        ("to".to_string(), format!("sfu.{target_node}.amp")),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    body,
+                );
+                if let Err(e) = peer_manager.send_to(&target_node, msg).await {
+                    // Don't warn on every failed relay packet — could be noisy
+                    debug!(target = %target_node, error = %e, "relay-data send failed");
                 }
             }
         }

@@ -1,3 +1,4 @@
+pub mod relay;
 pub mod room;
 pub mod session;
 
@@ -5,6 +6,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use amp::AmpMessage;
+use relay::{InboundRelays, OutboundRelays, RelayPacket};
 use room::{Role, RoomRegistry};
 use session::{Session, SessionEvent};
 use str0m::net::Receive;
@@ -34,6 +36,20 @@ pub enum SfuCommand {
         /// Role string: "publisher" or "subscriber".
         role: Option<String>,
     },
+    /// Remote node wants to subscribe to a local room's media.
+    RelaySubscribe {
+        room: String,
+        from_node: String,
+    },
+    /// Remote node unsubscribes from a local room.
+    RelayUnsubscribe {
+        room: String,
+        from_node: String,
+    },
+    /// Inbound relay media data from a remote node.
+    RelayData {
+        packet: RelayPacket,
+    },
     /// Shut down the SFU.
     Shutdown,
 }
@@ -43,6 +59,23 @@ pub enum SfuCommand {
 pub enum SfuEvent {
     /// An AMP message to route back through the bridge (e.g. SDP answer).
     SendMessage(AmpMessage),
+    /// Request relay subscription from a remote node's SFU.
+    /// meshd should send a `relay-subscribe` AMP command to the target node.
+    RequestRelay {
+        target_node: String,
+        room: String,
+    },
+    /// Cancel relay subscription.
+    CancelRelay {
+        target_node: String,
+        room: String,
+    },
+    /// Relay media data to a remote node.
+    /// meshd should send a `relay-data` AMP command to the target node.
+    RelayData {
+        target_node: String,
+        packet: RelayPacket,
+    },
 }
 
 /// Handle to a running SFU task.
@@ -52,7 +85,7 @@ pub struct SfuHandle {
 }
 
 /// SFU command names recognized in AMP messages.
-const SFU_COMMANDS: &[&str] = &["sdp-offer"];
+const SFU_COMMANDS: &[&str] = &["sdp-offer", "relay-subscribe", "relay-unsubscribe", "relay-data"];
 
 impl SfuHandle {
     /// Start the SFU: bind UDP, spawn event loop, return handle + event receiver.
@@ -96,6 +129,47 @@ impl SfuHandle {
         msg.command_name()
             .map_or(false, |cmd| SFU_COMMANDS.contains(&cmd))
     }
+
+    /// Parse an AMP message into an SfuCommand, if it's a recognized SFU command.
+    pub fn parse_command(msg: &AmpMessage) -> Option<SfuCommand> {
+        match msg.command_name()? {
+            "sdp-offer" => Some(SfuCommand::SdpOffer {
+                request_id: msg.get("id").unwrap_or("unknown").to_string(),
+                from_addr: msg.from_addr().unwrap_or("unknown").to_string(),
+                to_addr: msg.to_addr().unwrap_or("unknown").to_string(),
+                sdp: msg.body.clone(),
+                room: msg.get("room").map(|s| s.to_string()),
+                role: msg.get("role").map(|s| s.to_string()),
+            }),
+            "relay-subscribe" => {
+                let room = msg.get("room")?.to_string();
+                let from_node = msg.get("from-node")
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        msg.from_addr().and_then(|a| {
+                            amp::AmpAddress::parse(a).map(|addr| addr.node)
+                        })
+                    })?;
+                Some(SfuCommand::RelaySubscribe { room, from_node })
+            }
+            "relay-unsubscribe" => {
+                let room = msg.get("room")?.to_string();
+                let from_node = msg.get("from-node")
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        msg.from_addr().and_then(|a| {
+                            amp::AmpAddress::parse(a).map(|addr| addr.node)
+                        })
+                    })?;
+                Some(SfuCommand::RelayUnsubscribe { room, from_node })
+            }
+            "relay-data" => {
+                let packet: RelayPacket = serde_json::from_str(&msg.body).ok()?;
+                Some(SfuCommand::RelayData { packet })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The main SFU event loop — sans-I/O str0m driven by tokio.
@@ -107,6 +181,8 @@ async fn sfu_loop(
 ) {
     let mut sessions: Vec<Session> = Vec::new();
     let mut rooms = RoomRegistry::new();
+    let mut outbound_relays = OutboundRelays::new();
+    let mut inbound_relays = InboundRelays::new();
     let mut buf = vec![0u8; 2000]; // MTU-sized buffer for UDP
 
     info!("SFU event loop running");
@@ -146,6 +222,16 @@ async fn sfu_loop(
                             }
                         }
                     }
+                    Some(SfuCommand::RelaySubscribe { room, from_node }) => {
+                        outbound_relays.subscribe(&room, &from_node);
+                    }
+                    Some(SfuCommand::RelayUnsubscribe { room, from_node }) => {
+                        outbound_relays.unsubscribe(&room, &from_node);
+                    }
+                    Some(SfuCommand::RelayData { packet }) => {
+                        // Inbound relay: write media to local subscribers
+                        handle_relay_data(&packet, &rooms, &mut sessions, &socket).await;
+                    }
                     Some(SfuCommand::Shutdown) | None => {
                         info!("SFU shutting down");
                         break;
@@ -181,7 +267,7 @@ async fn sfu_loop(
                                     debug!(dest = %t.dest, error = %e, "UDP send failed");
                                 }
                             }
-                            process_events(i, events, &mut sessions, &rooms, &socket).await;
+                            process_events(i, events, &mut sessions, &rooms, &outbound_relays, &evt_tx, &socket).await;
                         } else {
                             debug!(source = %source, len, "no session for UDP packet");
                         }
@@ -212,7 +298,7 @@ async fn sfu_loop(
                     }
                 }
                 for (source_idx, events) in all_events {
-                    process_events(source_idx, events, &mut sessions, &rooms, &socket).await;
+                    process_events(source_idx, events, &mut sessions, &rooms, &outbound_relays, &evt_tx, &socket).await;
                 }
             }
         }
@@ -235,13 +321,15 @@ async fn sfu_loop(
 /// Process session events for room-based fanout.
 ///
 /// For each MediaData event from a publisher, find the room and write media
-/// to all subscribers. For KeyframeRequest events from subscribers, forward
-/// to the publisher.
+/// to all local subscribers and relay to remote nodes. For KeyframeRequest
+/// events from subscribers, forward to the publisher.
 async fn process_events(
     source_idx: usize,
     events: Vec<SessionEvent>,
     sessions: &mut Vec<Session>,
     rooms: &RoomRegistry,
+    outbound_relays: &OutboundRelays,
+    evt_tx: &mpsc::Sender<SfuEvent>,
     socket: &UdpSocket,
 ) {
     for event in events {
@@ -264,7 +352,24 @@ async fn process_events(
                     continue;
                 };
 
-                // Forward to each subscriber
+                // Forward to remote relay subscribers
+                if let Some(relay_nodes) = outbound_relays.subscribers(&room.name) {
+                    let packet = RelayPacket::from_media_data(
+                        &room.name,
+                        kind,
+                        data.params.pt(),
+                        data.time.numer() as u32,
+                        &data.data,
+                    );
+                    for node in relay_nodes {
+                        let _ = evt_tx.send(SfuEvent::RelayData {
+                            target_node: node.clone(),
+                            packet: packet.clone(),
+                        }).await;
+                    }
+                }
+
+                // Forward to each local subscriber
                 for &sub_idx in &room.subscribers {
                     if sub_idx >= sessions.len() {
                         continue;
@@ -328,6 +433,68 @@ async fn process_events(
                     }
                     break;
                 }
+            }
+        }
+    }
+}
+
+/// Handle inbound relay data from a remote node.
+///
+/// Write the media to all local subscribers in the room.
+async fn handle_relay_data(
+    packet: &RelayPacket,
+    rooms: &RoomRegistry,
+    sessions: &mut Vec<Session>,
+    socket: &UdpSocket,
+) {
+    let Some(kind) = packet.media_kind() else {
+        debug!(kind = %packet.kind, "unknown relay media kind");
+        return;
+    };
+
+    let Some(data) = packet.decode_data() else {
+        debug!(room = %packet.room, "relay packet decode failed");
+        return;
+    };
+
+    let Some(room) = rooms.rooms.get(&packet.room) else {
+        debug!(room = %packet.room, "relay data for unknown room");
+        return;
+    };
+
+    // Write to all local subscribers
+    for &sub_idx in &room.subscribers {
+        if sub_idx >= sessions.len() {
+            continue;
+        }
+        let Some(&sub_mid) = sessions[sub_idx].mid_by_kind.get(&kind) else {
+            continue;
+        };
+        let Some(writer) = sessions[sub_idx].rtc.writer(sub_mid) else {
+            continue;
+        };
+
+        // Find a matching payload type
+        let Some(pt) = writer.payload_params().next().map(|p| p.pt()) else {
+            continue;
+        };
+
+        let now = Instant::now();
+        // Use 90kHz for video, 48kHz for audio — standard RTP clock rates
+        let freq = match kind {
+            str0m::media::MediaKind::Video => str0m::media::Frequency::NINETY_KHZ,
+            str0m::media::MediaKind::Audio => str0m::media::Frequency::FORTY_EIGHT_KHZ,
+        };
+        let time = str0m::media::MediaTime::new(packet.time as u64, freq);
+        if let Err(e) = writer.write(pt, now, time, data.clone()) {
+            debug!(sub_idx, error = %e, "relay write to subscriber failed");
+        }
+
+        // Drain subscriber outputs after writing
+        let (transmits, _events, _timeout) = sessions[sub_idx].drain_outputs(now);
+        for t in transmits {
+            if let Err(e) = socket.send_to(&t.data, t.dest).await {
+                debug!(dest = %t.dest, error = %e, "UDP send failed");
             }
         }
     }
