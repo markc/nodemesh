@@ -1,0 +1,17 @@
+[package]
+name = "docparse"
+version = "0.1.0"
+edition = "2021"
+description = "Document text extraction CLI for PDF, DOCX, email, and plaintext"
+
+[[bin]]
+name = "docparse"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pdf-extract = "0.7"
+docx-rs = "0.4"
+mail-parser = "0.9"
